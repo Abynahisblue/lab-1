@@ -1,35 +1,84 @@
-
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  CloudFormation template to create IAM Groups with S3 read access
-  and Secrets Manager for one-time password generation.
+  CloudFormation template to create IAM Groups with S3 read access,
+  Secrets Manager for one-time password generation, and DynamoDB email update functionality.
+
+Parameters:
+  UserEmailAddress:
+    Type: String
+    Default: "user1@example.com"
+    Description: "Email address for User 1"
+
+  EnvironmentType:
+    Type: String
+    Default: "dev"
+    AllowedValues:
+      - "dev"
+      - "test"
+      - "prod"
+    Description: "Environment type for resource naming"
+
+  PasswordLength:
+    Type: Number
+    Default: 8
+    MinValue: 8
+    MaxValue: 64
+    Description: "Length of generated password"
+
+  PasswordResetRequired:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Whether password reset is required at first login"
+
+  UserTableName:
+    Type: String
+    Default: "UserEmailTable"
+    Description: "Name of the DynamoDB table for user emails"
 
 Resources:
+  UserEmailTable:
+    Type: "AWS::DynamoDB::Table"
+    Properties:
+      TableName: !Ref UserTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: "userId"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "userId"
+          KeyType: "HASH"
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentType
+
   OneTimePassword:
     Type: "AWS::SecretsManager::Secret"
     Properties:
-      Name: OneTimePassword
+      Name: !Sub "${EnvironmentType}-OneTimePassword"
       Description: "This secret has a dynamically generated secret password."
       GenerateSecretString:
         SecretStringTemplate: '{"username": "test-user"}'
         GenerateStringKey: "password"
-        PasswordLength: 8
+        PasswordLength: !Ref PasswordLength
         ExcludeCharacters: '@/\'
-  
+
   S3Group:
     Type: "AWS::IAM::Group"
     Properties:
-      GroupName: S3Group
-  
+      GroupName: !Sub "${EnvironmentType}-S3Group"
+
   EC2Group:
     Type: "AWS::IAM::Group"
     Properties:
-      GroupName: EC2Group
-  
+      GroupName: !Sub "${EnvironmentType}-EC2Group"
+
   S3ReadAccessPolicy:
     Type: "AWS::IAM::Policy"
     Properties:
-      PolicyName: S3ReadAccessPolicy
+      PolicyName: !Sub "${EnvironmentType}-S3ReadAccessPolicy"
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -41,25 +90,25 @@ Resources:
       Groups:
         - !Ref S3Group
         - !Ref EC2Group
-  
+
   IAMUser1:
     Type: AWS::IAM::User
     Properties:
-      UserName: "user1"
+      UserName: !Sub "${EnvironmentType}-user1"
       Groups:
         - !Ref S3Group
       LoginProfile:
         Password: !Sub "{{resolve:secretsmanager:${OneTimePassword}::password}}"
-        PasswordResetRequired: true
-  
+        PasswordResetRequired: !Ref PasswordResetRequired
+
   User1EmailParameter:
     Type: "AWS::SSM::Parameter"
     Properties:
-      Name: "/user/emails/user1"
+      Name: !Sub "/user/emails/${EnvironmentType}-user1"
       Type: String
-      Value: "user1@example.com"
+      Value: !Ref UserEmailAddress
       Description: "Email address for User 1"
-  
+
   UserCreationEventRule:
     Type: "AWS::Events::Rule"
     Properties:
@@ -77,7 +126,7 @@ Resources:
       Targets:
         - Arn: !GetAtt PrintUserPasswordLambda.Arn
           Id: "NotifyUserLambdaFunction"
-  
+
   PrintUserPasswordLambda:
     Type: "AWS::Lambda::Function"
     Properties:
@@ -85,45 +134,195 @@ Resources:
       Role: !GetAtt LambdaExecutionRole.Arn
       Code:
         ZipFile: |
-          import json
-          import boto3
+          const AWS = require('aws-sdk');
           
-          def handler(event, context):
-              print("starting..")
+          exports.handler = async (event, context) => {
+            console.log("starting..");
           
-              ssm = boto3.client('ssm')
-              secrets_manager = boto3.client('secretsmanager')
+            const ssm = new AWS.SSM();
+            const secretsManager = new AWS.SecretsManager();
+            const dynamodb = new AWS.DynamoDB.DocumentClient();
           
-              user_name = event['detail']['requestParameters']['userName']
-              email_param = f"/user/emails/{user_name.lower()}"
+            const userName = event.detail.requestParameters.userName;
+            const emailParam = `/user/emails/${userName.toLowerCase()}`;
           
-              email_response = ssm.get_parameter(Name=email_param, WithDecryption=False)
-              email = email_response['Parameter']['Value']
+            try {
+              // Get user email from SSM Parameter Store
+              const emailResponse = await ssm.getParameter({
+                Name: emailParam,
+                WithDecryption: false
+              }).promise();
+              const email = emailResponse.Parameter.Value;
           
-              secret_name = "OneTimePassword"
-              secret_response = secrets_manager.get_secret_value(SecretId=secret_name)
-              secret = json.loads(secret_response['SecretString'])
-              password = secret['password']
+              // Get password from Secrets Manager
+              const secretName = process.env.SECRET_NAME;
+              const secretResponse = await secretsManager.getSecretValue({
+                SecretId: secretName
+              }).promise();
           
-              print(f"User Name: {user_name}")
-              print(f"Email: {email}")
-              print(f"Password: {password}")
+              const secret = JSON.parse(secretResponse.SecretString);
+              const password = secret.password;
+          
+              // Store data in DynamoDB
+              const userId = userName.split('-').pop(); // Extract user ID from username
+          
+              await dynamodb.put({
+                TableName: process.env.TABLE_NAME,
+                Item: {
+                  userId: userId,
+                  email: email,
+                  createdAt: new Date().toISOString()
+                }
+              }).promise();
+          
+              console.log(`User Name: ${userName}`);
+              console.log(`Email: ${email}`);
+              console.log(`Password: ${password}`);
           
               return {
-                  'statusCode': 200,
-                  'body': json.dumps({
-                      'userName': user_name,
-                      'email': email,
-                      'password': password}
-                  )
-              }
-      Runtime: python3.12
+                statusCode: 200,
+                body: JSON.stringify({
+                  userName: userName,
+                  email: email,
+                  password: password
+                })
+              };
+            } catch (error) {
+              console.error('Error:', error);
+              throw error;
+            }
+          };
+      Runtime: nodejs18.x
       Timeout: 10
-  
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UserEmailTable
+          SECRET_NAME: !Ref OneTimePassword
+
+  UpdateEmailLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          
+          exports.handler = async (event, context) => {
+            console.log("Starting email update process...");
+          
+            // Initialize AWS clients
+            const dynamodb = new AWS.DynamoDB.DocumentClient();
+            const ssm = new AWS.SSM();
+          
+            // If no userId provided, we cannot proceed
+            if (!event.userId) {
+              return {
+                statusCode: 400,
+                body: JSON.stringify({
+                  error: "Missing userId in request"
+                })
+              };
+            }
+          
+            const userId = event.userId;
+            const newEmail = event.newEmail;
+          
+            try {
+              // First query to check if user exists
+              const queryResult = await dynamodb.get({
+                TableName: process.env.TABLE_NAME,
+                Key: {
+                  userId: userId
+                }
+              }).promise();
+          
+              // If user doesn't exist
+              if (!queryResult.Item) {
+                return {
+                  statusCode: 404,
+                  body: JSON.stringify({
+                    error: "User not found"
+                  })
+                };
+              }
+          
+              const currentEmail = queryResult.Item.email;
+              console.log(`Current email for user ${userId}: ${currentEmail}`);
+          
+              // If no new email provided, just return the current one
+              if (!newEmail) {
+                return {
+                  statusCode: 200,
+                  body: JSON.stringify({
+                    userId: userId,
+                    email: currentEmail
+                  })
+                };
+              }
+          
+              // Update DynamoDB
+              await dynamodb.update({
+                TableName: process.env.TABLE_NAME,
+                Key: {
+                  userId: userId
+                },
+                UpdateExpression: "set email = :e, updatedAt = :d",
+                ExpressionAttributeValues: {
+                  ":e": newEmail,
+                  ":d": new Date().toISOString()
+                },
+                ReturnValues: "UPDATED_NEW"
+              }).promise();
+          
+              // Update SSM parameter if it exists
+              try {
+                const paramName = `/user/emails/${process.env.ENVIRONMENT}-${userId}`;
+                await ssm.putParameter({
+                  Name: paramName,
+                  Value: newEmail,
+                  Type: "String",
+                  Overwrite: true
+                }).promise();
+                console.log(`Updated SSM parameter ${paramName}`);
+              } catch (ssmError) {
+                console.warn("Could not update SSM parameter:", ssmError);
+                // Continue execution even if SSM update fails
+              }
+          
+              console.log(`Successfully updated email for user ${userId} to ${newEmail}`);
+          
+              return {
+                statusCode: 200,
+                body: JSON.stringify({
+                  userId: userId,
+                  previousEmail: currentEmail,
+                  newEmail: newEmail,
+                  status: "updated"
+                })
+              };
+            } catch (error) {
+              console.error('Error:', error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({
+                  error: "Internal server error",
+                  message: error.message
+                })
+              };
+            }
+          };
+      Runtime: nodejs18.x
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UserEmailTable
+          ENVIRONMENT: !Ref EnvironmentType
+
   LambdaExecutionRole:
     Type: "AWS::IAM::Role"
     Properties:
-      RoleName: "LambdaExecutionRole"
+      RoleName: !Sub "${EnvironmentType}-LambdaExecutionRole"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -131,6 +330,8 @@ Resources:
             Principal:
               Service: "lambda.amazonaws.com"
             Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
       Policies:
         - PolicyName: "LambdaUserAccess"
           PolicyDocument:
@@ -139,10 +340,15 @@ Resources:
               - Effect: "Allow"
                 Action:
                   - "ssm:GetParameter"
+                  - "ssm:PutParameter"
                   - "secretsmanager:GetSecretValue"
                   - "logs:*"
+                  - "dynamodb:GetItem"
+                  - "dynamodb:PutItem"
+                  - "dynamodb:UpdateItem"
+                  - "dynamodb:Query"
                 Resource: "*"
-  
+
   LambdaInvokePermission:
     Type: "AWS::Lambda::Permission"
     Properties:
@@ -150,15 +356,34 @@ Resources:
       FunctionName: !GetAtt PrintUserPasswordLambda.Arn
       Principal: "events.amazonaws.com"
       SourceArn: !GetAtt UserCreationEventRule.Arn
-  
-  CloudWatchLogGroup:
+
+  CloudWatchLogGroupLambda1:
     Type: "AWS::Logs::LogGroup"
     Properties:
       LogGroupName: !Sub "/aws/lambda/${PrintUserPasswordLambda}"
-      RetentionInDays: 2
+      RetentionInDays: 7
     DependsOn: PrintUserPasswordLambda
+
+  CloudWatchLogGroupLambda2:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${UpdateEmailLambda}"
+      RetentionInDays: 7
+    DependsOn: UpdateEmailLambda
 
 Outputs:
   User1Details:
     Description: "Email and Password of User 1"
-    Value: !Sub "Email: {{resolve:ssm:/user/emails/user1}}, Password: {{resolve:secretsmanager:${OneTimePassword}::password}}"
+    Value: !Sub "Email: {{resolve:ssm:/user/emails/${EnvironmentType}-user1}}, Password: {{resolve:secretsmanager:${OneTimePassword}::password}}"
+
+  UserEmailTable:
+    Description: "DynamoDB table name for user emails"
+    Value: !Ref UserEmailTable
+
+  UpdateEmailLambdaArn:
+    Description: "ARN of the Lambda function to update user emails"
+    Value: !GetAtt UpdateEmailLambda.Arn
+
+  SampleUpdateEmailCommand:
+    Description: "Sample AWS CLI command to invoke the email update Lambda"
+    Value: !Sub "aws lambda invoke --function-name ${UpdateEmailLambda} --payload '{\"userId\":\"user1\",\"newEmail\":\"newemail@example.com\"}' response.json"
