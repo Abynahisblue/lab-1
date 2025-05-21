@@ -1,244 +1,164 @@
-AWSTemplateFormatVersion: '2010-09-09'
-Description: Creates IAM users with specific permissions and automates password logging.
 
-Parameters:
-  AdminEmail:
-    Type: String
-    Description: Email address where notifications can be sent.
-  S3ReadAccessPolicyName:
-    Type: String
-    Default: S3ReadAccessPolicy
-    Description: Name for the S3 read-only policy.
-  EC2ReadAccessPolicyName:
-    Type: String
-    Default: EC2ReadAccessPolicy
-    Description: Name for the EC2 read-only policy.
-  TemporaryPasswordSecretName:
-    Type: String
-    Default: TemporaryUserPassword
-    Description: Name of the Secrets Manager secret for the temporary password.
-  UserEmailPrefix:
-    Type: String
-    Default: user
-    Description: Prefix for the user email stored in Parameter Store.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CloudFormation template to create IAM Groups with S3 read access
+  and Secrets Manager for one-time password generation.
 
 Resources:
-  # 1. One-Time Password in Secrets Manager
-  TemporaryPasswordSecret:
-    Type: AWS::SecretsManager::Secret
+  OneTimePassword:
+    Type: "AWS::SecretsManager::Secret"
     Properties:
-      Description: Temporary password for new IAM users
+      Name: OneTimePassword
+      Description: "This secret has a dynamically generated secret password."
       GenerateSecretString:
-        PasswordLength: 16
-        ExcludeCharacters: '"@/\'
-        RequireEachIncludedType: true
-
-  # 2. S3 User Group with Read Access
-  S3UserGroup:
-    Type: AWS::IAM::Group
+        SecretStringTemplate: '{"username": "test-user"}'
+        GenerateStringKey: "password"
+        PasswordLength: 8
+        ExcludeCharacters: '@/\'
+  
+  S3Group:
+    Type: "AWS::IAM::Group"
     Properties:
-      GroupName: S3ReadOnlyGroup
-      Policies:
-        - PolicyName: !Ref S3ReadAccessPolicyName
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:ListBucket
-                Resource: "*"
-
-  # 3. EC2 User Group with Read Access
-  EC2UserGroup:
-    Type: AWS::IAM::Group
+      GroupName: S3Group
+  
+  EC2Group:
+    Type: "AWS::IAM::Group"
     Properties:
-      GroupName: EC2ReadOnlyGroup
-      Policies:
-        - PolicyName: !Ref EC2ReadAccessPolicyName
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - ec2:DescribeInstances
-                  - ec2:DescribeRegions
-                  - ec2:DescribeAvailabilityZones
-                Resource: "*"
-
-  # 4. IAM User: ec2-user
-  EC2User:
+      GroupName: EC2Group
+  
+  S3ReadAccessPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: S3ReadAccessPolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "s3:GetObject"
+              - "s3:ListBucket"
+            Resource: "*"
+      Groups:
+        - !Ref S3Group
+        - !Ref EC2Group
+  
+  IAMUser1:
     Type: AWS::IAM::User
     Properties:
-      UserName: ec2-user
+      UserName: "user1"
       Groups:
-        - !Ref EC2UserGroup
-      Password: !GetAtt TemporaryPasswordSecret.SecretString
-      PasswordResetRequired: true
-      Tags:
-        - Key: Email
-          Value: !Sub "${UserEmailPrefix}-ec2@example.com"
-
-  # Store ec2-user email in Parameter Store
-  EC2UserEmailParam:
-    Type: AWS::SSM::Parameter
+        - !Ref S3Group
+      LoginProfile:
+        Password: !Sub "{{resolve:secretsmanager:${OneTimePassword}::password}}"
+        PasswordResetRequired: true
+  
+  User1EmailParameter:
+    Type: "AWS::SSM::Parameter"
     Properties:
-      Name: !Sub "/users/ec2-user/email"
+      Name: "/user/emails/user1"
       Type: String
-      Value: !GetAtt EC2User.Tags.0.Value
-
-  # 4. IAM User: s3-user
-  S3User:
-    Type: AWS::IAM::User
+      Value: "user1@example.com"
+      Description: "Email address for User 1"
+  
+  UserCreationEventRule:
+    Type: "AWS::Events::Rule"
     Properties:
-      UserName: s3-user
-      Groups:
-        - !Ref S3UserGroup
-      Password: !GetAtt TemporaryPasswordSecret.SecretString
-      PasswordResetRequired: true
-      Tags:
-        - Key: Email
-          Value: !Sub "${UserEmailPrefix}-s3@example.com"
-
-  # Store s3-user email in Parameter Store
-  S3UserEmailParam:
-    Type: AWS::SSM::Parameter
+      Description: Rule to detect new IAM user creation
+      EventPattern:
+        source:
+          - "aws.iam"
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventSource:
+            - "iam.amazonaws.com"
+          eventName:
+            - "CreateUser"
+      Targets:
+        - Arn: !GetAtt PrintUserPasswordLambda.Arn
+          Id: "NotifyUserLambdaFunction"
+  
+  PrintUserPasswordLambda:
+    Type: "AWS::Lambda::Function"
     Properties:
-      Name: !Sub "/users/s3-user/email"
-      Type: String
-      Value: !GetAtt S3User.Tags.0.Value
-
-  # 5. Lambda Function to Log User Info (Java)
-  LogNewUserFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      Handler: example.Handler
-      Role: !GetAtt LogNewUserRole.Arn
-      Runtime: java11
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
       Code:
         ZipFile: |
-          package example;
-
-          import com.amazonaws.services.lambda.runtime.Context;
-          import com.amazonaws.services.lambda.runtime.RequestHandler;
-          import com.amazonaws.services.lambda.runtime.events.AwsEventBridgeEvent;
-          import software.amazon.awssdk.regions.Region;
-          import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
-          import software.amazon.awssdk.services.secretsmanager.model.GetSecretValueRequest;
-          import software.amazon.awssdk.services.secretsmanager.model.GetSecretValueResponse;
-          import software.amazon.awssdk.services.ssm.SsmClient;
-          import software.amazon.awssdk.services.ssm.model.GetParameterRequest;
-          import software.amazon.awssdk.services.ssm.model.GetParameterResponse;
-          import java.util.Map;
-
-          public class Handler implements RequestHandler<AwsEventBridgeEvent<Map<String, Object>>, String> {
-            
-              @Override
-              public String handleRequest(AwsEventBridgeEvent<Map<String, Object>> event, Context context) {
-                  if ("AWS API Call via CloudTrail".equals(event.getDetailType())) {
-                      Map<String, Object> detail = event.getDetail();
-                      if ("CreateUser".equals(detail.get("eventName"))) {
-                          Map<String, Object> requestParams = (Map<String, Object>) detail.get("requestParameters");
-                          if (requestParams != null) {
-                              String userName = (String) requestParams.get("userName");
-                              try {
-                                  // Get region from environment variable
-                                  Region region = Region.of(System.getenv("AWS_REGION"));
-                                  
-                                  // Get temporary password from Secrets Manager
-                                  SecretsManagerClient secretsClient = SecretsManagerClient.builder()
-                                      .region(region)
-                                      .build();
-                                  
-                                  GetSecretValueRequest secretRequest = GetSecretValueRequest.builder()
-                                      .secretId(System.getenv("TEMP_PASSWORD_SECRET_NAME"))
-                                      .build();
-                                  
-                                  GetSecretValueResponse secretResponse = secretsClient.getSecretValue(secretRequest);
-                                  String temporaryPassword = secretResponse.secretString();
-                                  
-                                  // Get user email from Parameter Store
-                                  SsmClient ssmClient = SsmClient.builder()
-                                      .region(region)
-                                      .build();
-                                  
-                                  GetParameterRequest paramRequest = GetParameterRequest.builder()
-                                      .name(String.format("/users/%s/email", userName))
-                                      .build();
-                                  
-                                  GetParameterResponse paramResponse = ssmClient.getParameter(paramRequest);
-                                  String userEmail = paramResponse.parameter().value();
-                                  
-                                  // Log user information
-                                  context.getLogger().log(String.format(
-                                      "New User Created: %s, Email: %s, Temporary Password: %s",
-                                      userName, userEmail, temporaryPassword));
-                                  
-                              } catch (Exception e) {
-                                  context.getLogger().log("Error retrieving user info: " + e.getMessage());
-                                  e.printStackTrace();
-                              }
-                          }
-                      }
-                  }
-                  return "Function executed successfully!";
+          import json
+          import boto3
+          
+          def handler(event, context):
+              print("starting..")
+          
+              ssm = boto3.client('ssm')
+              secrets_manager = boto3.client('secretsmanager')
+          
+              user_name = event['detail']['requestParameters']['userName']
+              email_param = f"/user/emails/{user_name.lower()}"
+          
+              email_response = ssm.get_parameter(Name=email_param, WithDecryption=False)
+              email = email_response['Parameter']['Value']
+          
+              secret_name = "OneTimePassword"
+              secret_response = secrets_manager.get_secret_value(SecretId=secret_name)
+              secret = json.loads(secret_response['SecretString'])
+              password = secret['password']
+          
+              print(f"User Name: {user_name}")
+              print(f"Email: {email}")
+              print(f"Password: {password}")
+          
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'userName': user_name,
+                      'email': email,
+                      'password': password}
+                  )
               }
-          }
-      Timeout: 30
-      MemorySize: 512
-      Environment:
-        Variables:
-          TEMP_PASSWORD_SECRET_NAME: !Ref TemporaryPasswordSecretName
-          AWS_REGION: !Ref AWS::Region
-
-  # IAM Role for Lambda Function
-  LogNewUserRole:
-    Type: AWS::IAM::Role
+      Runtime: python3.12
+      Timeout: 10
+  
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
     Properties:
+      RoleName: "LambdaExecutionRole"
       AssumeRolePolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
-          - Effect: Allow
+          - Effect: "Allow"
             Principal:
-              Service:
-                - lambda.amazonaws.com
-            Action:
-              - sts:AssumeRole
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
       Policies:
-        - PolicyName: LogNewUserInfoPolicy
+        - PolicyName: "LambdaUserAccess"
           PolicyDocument:
-            Version: '2012-10-17'
+            Version: "2012-10-17"
             Statement:
-              - Effect: Allow
+              - Effect: "Allow"
                 Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: arn:aws:logs:*:*:*
-              - Effect: Allow
-                Action:
-                  - secretsmanager:GetSecretValue
-                Resource: !Ref TemporaryPasswordSecret
-              - Effect: Allow
-                Action:
-                  - ssm:GetParameter
-                Resource: arn:aws:ssm:*:*:parameter/users/*
-
-  # 6. EventBridge Rule
-  NewUserEventRule:
-    Type: AWS::Events::Rule
+                  - "ssm:GetParameter"
+                  - "secretsmanager:GetSecretValue"
+                  - "logs:*"
+                Resource: "*"
+  
+  LambdaInvokePermission:
+    Type: "AWS::Lambda::Permission"
     Properties:
-      Name: NewIAMUserCreated
-      EventPattern:
-        Source:
-          - aws.iam
-        DetailType:
-          - AWS API Call via CloudTrail
-        Detail:
-          eventSource:
-            - iam.amazonaws.com
-          eventName:
-            - CreateUser
-      Targets:
-        - Id: LogNewUserTarget
-          Arn: !GetAtt LogNewUserFunction.Arn
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt PrintUserPasswordLambda.Arn
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt UserCreationEventRule.Arn
+  
+  CloudWatchLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${PrintUserPasswordLambda}"
+      RetentionInDays: 2
+    DependsOn: PrintUserPasswordLambda
+
+Outputs:
+  User1Details:
+    Description: "Email and Password of User 1"
+    Value: !Sub "Email: {{resolve:ssm:/user/emails/user1}}, Password: {{resolve:secretsmanager:${OneTimePassword}::password}}"
