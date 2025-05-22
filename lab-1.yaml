@@ -69,10 +69,6 @@ Resources:
     Type: "AWS::IAM::Group"
     Properties:
       GroupName: !Sub "${EnvironmentType}-S3Group"
-  S3Group2:
-    Type: "AWS::IAM::Group"
-    Properties:
-    GroupName: !Sub "${EnvironmentType}-S3Group"
 
   EC2Group:
     Type: "AWS::IAM::Group"
