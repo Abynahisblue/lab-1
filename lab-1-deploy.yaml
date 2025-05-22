@@ -1,0 +1,8 @@
+template-file-path: lab-1.yaml
+parameters:
+  PasswordResetRequired: 'true'
+  EnvironmentType: dev
+  PasswordLength: '8'
+  UserTableName: UserEmailTable
+  UserEmailAddress: user1@example.com
+tags: {}
